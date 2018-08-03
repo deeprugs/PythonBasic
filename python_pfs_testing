@@ -1,0 +1,929 @@
+# -*- coding: cp1252 -*-
+import random
+import bisect
+import math
+import csv
+import xml.etree.ElementTree as ET
+from difflib import ndiff
+
+#-----GLOBALS-------<<Need to figure out a way to circumvent this>>
+
+##    Initialize bandwidth and the number of resource blocks
+n_dl_rb            = 25
+
+
+
+#---- CLASSES ------
+
+class TBL_DB:
+
+##    Static Tables which are used in the Resource allocation algorithms.
+##    http://stackoverflow.com/questions/68645/static-class-variables-in-python
+    TBS_TABLE             = {} # 36.213 Table
+    TBS_LIST              = [] # Unique TBS arranged in ascending order.
+    UNIQUE_SORTED_TBS_IDX = {} # A dictionary. The input is a TB Size; The output is an Index for the TBS_LIST
+    INV_TBS_LIST          = [] # a list of lists. For a given TBS, what are the (mcs,nprb) combinations possible.
+    ue_category_maxtbs    = [10296, 51024, 75376, 75376, 151376]
+    cqi_to_itbs_mapping   = [3,3,5,5,6,8,9,11,12,15,16,18,20,22,23,26] # This is actually i_tbs mapping.
+    subband_sysbw         = {} # 36.213 Table 7.2.1-3: Subband Size (k) vs. System Bandwidth
+
+##    TODO : A very stupid way of mapping subband size to system bw, I will do it later - use only one var
+    for i in range(8,110):
+        if   (i <= 26):
+            subband_sysbw[i] = 4
+        elif (i <= 63):
+            subband_sysbw[i] = 6
+        elif (i<=110):
+            subband_sysbw[i] = 8
+
+    def create_inv_tbs_lst(self):
+
+        tmp = [[] for i in range(0,len(self.TBS_LIST))]
+
+        for i in self.TBS_LIST:
+            for j in self.TBS_TABLE.keys():
+                if i == self.TBS_TABLE[j]:
+                    tmp [self.UNIQUE_SORTED_TBS_IDX[i]].append(j)
+            self.INV_TBS_LIST.append(sorted(tmp[self.UNIQUE_SORTED_TBS_IDX[i]],key=lambda tup: tup[1]))
+
+    def __init__(self,n_dl_rb):
+
+        tbs_file = open('tbs.txt','r')
+        i = j = 0
+        for line in tbs_file:
+            j=1
+            for word in line.split():
+                self.TBS_TABLE[i,j] = int(word)
+                j = j+1
+            i = i+1
+        self.TBS_LIST = list(set(self.TBS_TABLE.values()))
+        self.TBS_LIST.sort()
+
+        idx = 0
+        for i in self.TBS_LIST:
+            self.UNIQUE_SORTED_TBS_IDX[i] = idx
+            idx = idx+1
+
+        self.create_inv_tbs_lst()
+
+
+    def round_it_to_next_tbs(self,tbs_list, x):
+        'Find leftmost in the sorted TBS_LIST value greater than x'
+        MAX_VALUE_TBS=75376
+
+        i = bisect.bisect_right(tbs_list, x)
+        if i != len(tbs_list):
+            return tbs_list[i]
+        return MAX_VALUE_TBS
+
+class PRB_RESOURCE_ALLOCATOR:
+
+    global n_dl_rb;
+
+##      Coefficents used for scheduling Sk(t)
+    alpha_ravg_iir          = 0.2   # Ravg IIR
+    alpha_ravg_exp          = 1     # Ravg Exponential
+    beta_rcurrent_exp       = 1     # Rk Exponential
+
+##        Initialize the table database singleton
+    tbldb = TBL_DB(n_dl_rb)
+
+    def __init__(self,n_dl_rb):
+
+        self.n_dl_rb      = n_dl_rb
+        self.remaining_rb = n_dl_rb
+        self.rb_map       = []
+        self.rbg_map      = []
+
+        for i in range(0,100):
+            self.rb_map.append(0)
+
+##    Determine the rbg size and map it to system bandwidth
+        if (n_dl_rb <=10   ):
+            self.rbg_size = 1;
+        elif (n_dl_rb >=11) and  (n_dl_rb <=26):
+            self.rbg_size = 2;
+        elif (n_dl_rb>=27) and (n_dl_rb <=63):
+            self.rbg_size = 3;
+        elif (n_dl_rb>=64) and (n_dl_rb <=110):
+            self.rbg_size = 4;
+
+##        This variable self.num_rbgs serves as BOTH the number of subbands and can be used to index the last subband as num_rbgs-1
+        self.num_rbgs            = int(math.ceil(float(self.n_dl_rb)/self.rbg_size))
+        
+        
+
+        self.num_rbg_per_subband = int(self.tbldb.subband_sysbw[self.n_dl_rb]/self.rbg_size) 
+
+##        This variable self.num_subbands serves as BOTH the number of subbands and can be used to index the last subband as num_subbands-1
+        self.num_subbands        = int(math.ceil(n_dl_rb*1.0/self.tbldb.subband_sysbw[self.n_dl_rb]))
+
+        self.last_rbg_size      = self.n_dl_rb % (self.rbg_size)
+
+        if(self.n_dl_rb % (self.tbldb.subband_sysbw[self.n_dl_rb]) ):
+            self.last_subband_size_in_rb  = self.n_dl_rb % (self.tbldb.subband_sysbw[self.n_dl_rb])
+        else:
+            self.last_subband_size_in_rb  = self.tbldb.subband_sysbw[self.n_dl_rb]
+        
+
+        print('num_rbgs :', self.num_rbgs,'num_rbg_per_subband:',self.num_rbg_per_subband,'last subband size in rb = ', self.last_subband_size_in_rb, 'number of subbands = ',self.num_subbands)
+
+        for i in range(0,self.num_rbgs):
+            self.rbg_map.append(0)
+
+    def refresh_resource_maps(self):
+        global n_dl_rb;
+
+        for i in range(0,100):
+            self.rb_map[i] = 0
+
+        for i in range(0,self.num_rbgs):
+            self.rbg_map[i] = 0
+
+        self.remaining_rb = n_dl_rb
+
+    def init_resource_maps(self):
+        for i in range(0,100):
+            self.rb_map.append(0)
+
+        self.remaining_rb = n_dl_rb
+
+
+
+    def check_contiguous_nprb_available(self,nprb):
+        for i in range(0,n_dl_rb):
+            free_rb = 0
+            for j in range(i,n_dl_rb):
+                if self.rb_map[j] != 0:
+                    break
+                else:
+                    free_rb += 1
+                    if free_rb == nprb:
+                        return i
+        return -1
+
+    def set_contiguous_rb_rat2(self,start_rb_ptr,num_prb):
+        global current_tti
+        for i in range(start_rb_ptr,min(start_rb_ptr+num_prb,len(self.rb_map))):
+            if self.rb_map[i] != 0:
+                print('tti:',current_tti,'set_rat2: Error! ith bit of the rb_bitmap is ',i,'alloc_rat2 was trying: start_rb:',start_rb_ptr,'num_prb:',num_prb)
+                return -1
+            self.rb_map[i] = 1
+            self.set_rbg_map_from_rb(self.rb_map[i]) # TODO : This line can be optimized. But that's for later.
+            return 0
+        
+    
+    def get_rbg_list_from_subband_num(self,sb_num):
+##        For a given subband it will return the corresponding RBGs belonging to that subband.
+        if (sb_num != self.num_subbands-1):
+            return list(range(sb_num*self.num_rbg_per_subband, (sb_num+1)*self.num_rbg_per_subband))
+        else:
+            x = sb_num*self.num_rbg_per_subband
+            y = x + int(math.ceil((self.last_subband_size_in_rb/self.rbg_size)))
+##            print('subband number is :',sb_num,'RBG per subband is:',self.num_rbg_per_subband,'last subband has ',math.ceil((self.last_subband_size_in_rb/self.rbg_size)),'RBGS. range(',x,',',y,')')
+            return list(range(x, y))
+        
+    
+
+##
+##    Imagine rb_map as a lower layer bitmap and rbg_map as a higher layer bitmap.
+##    If we are allocating using rb, then we should also modify the affected rbgs in the rbg_map.
+##    If we are allocating using rbg, then we should also modify the affected rbs in the rb_map.
+##    These 2 routines set_rbg_map_from_rb and set_rb_map_from_rbg are used for that purpose.
+##
+    def set_rbg_map_from_rb(self,rb_num):
+        rbg_num = int(math.ceil(float(rb_num)/self.rbg_size))
+        self.rbg_map[rbg_num]=1
+
+    def set_rbg(self,rbg_num):
+        global current_tti
+#         print('current_tti',current_tti,'set_rbg_call for rbg_num:',rbg_num)
+        rb_start = rbg_num * self.rbg_size;
+        for i in range(rb_start,min(rb_start+self.rbg_size,len(self.rb_map))):
+            self.rb_map[i] = 1
+        self.rbg_map[rbg_num]=1
+        if (self.remaining_rb >= self.rbg_size):
+            self.remaining_rb -= self.rbg_size
+        else:
+            self.remaining_rb = 0
+            
+
+    def rat0_find_num_rbs(self,rbg_num):
+        last_rbg_num = sched.num_rbgs-1
+        if(rbg_num != last_rbg_num):
+            num_rbs = self.rbg_size;
+        else:
+            num_rbs = self.last_rbg_size
+            
+        return num_rbs
+
+    def allocate_rat0(self,fss_entry,fss_tti_data):
+##        fss_entry is a tuple made of (svc,subband_pfm,subband number,buffer_tbs)
+        svc        = fss_entry[0]
+        sb_num     = fss_entry[2]
+        buffer_tbs = fss_entry[3]
+        ue         = svc.parent
+        rbg_list   = self.get_rbg_list_from_subband_num(sb_num)
+
+##        import pdb; pdb.set_trace();
+        
+##        dk_pfs_fss       
+
+        if (svc.bo != 0):
+#             print ('current_tti',current_tti,'sb_num',sb_num,'rbg_list:',rbg_list)
+            for rbg_num in rbg_list:
+                if(self.rbg_map[rbg_num] == 0):
+                    self.set_rbg(rbg_num)
+                    if not ue.dci1_info:
+                        ue.dci1_info.append(DCI_FMT_1_INFO())
+#                         ('currenttti','ue_id','cqi','mcs','nprb_ue','tbs',bitmap, scqi[],
+                        tti_data_entry = (ue,svc,fss_entry[3])
+                        fss_tti_data.append(tti_data_entry)
+                    ue.dci1_info[0].update_dc_fmt_1_bitmap(rbg_num)
+                    svc.update_queue_data_fss(rbg_num)
+                    
+                    if (self.remaining_rb == 0):
+                        return 'RAT0_ALLOC_PRBs_EXHASUTED'
+#             print('current_tti',current_tti,'bitmap:',self.rbg_map)        
+            return 'RAT0_ALLOC_OK'
+        else:
+            return 'RAT0_ALLOC_BUFFER_EXHAUSTED'
+                
+
+
+    def allocate_rat2(self,ue,svc):
+
+        global csv_output
+
+        if self.remaining_rb == 0:
+            print('Resource allocation failed - No more PRBs available')
+            return 'RAT2_ALLOC_FAILED_PRB_EXHAUSTED'
+
+##        import pdb; pdb.set_trace()
+        random_nprb = random.randint(int(svc.rat2_num_rbs[0]),int(svc.rat2_num_rbs[1]))
+
+        random_nprb = min(random_nprb,self.remaining_rb)
+
+    #     import pdb; pdb.set_trace();
+
+        # start_rb_ptr = self.check_contiguous_nprb_available(random_nprb)
+        # if (start_rb_ptr== -1):
+        #     return 'RAT2_ALLOC_FAILED_NO_CONTIG_PRB'
+
+        random_tbs = self.tbldb.TBS_TABLE[ue.mcs_val,random_nprb]
+
+        buffer_tbs = self.tbldb.round_it_to_next_tbs(self.tbldb.TBS_LIST,svc.bo)
+
+        if (buffer_tbs > random_tbs ):
+    #         We can give only random_nprb PRBS
+            mcs_ue   = ue.mcs_val
+            nprb_ue  = random_nprb
+        else:
+            attempt = 0
+            mcs_ue   = nprb_ue = -1
+            found = False
+            buffer_tbs_idx = self.tbldb.UNIQUE_SORTED_TBS_IDX[buffer_tbs]
+            for attempt in range(1,3):
+                for mcs_candidate in self.tbldb.INV_TBS_LIST[buffer_tbs_idx]:
+                    if mcs_candidate[0] <= ue.mcs_val:
+                        if mcs_candidate[1] <= random_nprb:
+                            mcs_ue    = mcs_candidate[0]
+                            nprb_ue   = mcs_candidate[1]
+                            found = True
+                            break;
+                if (found == True):
+                    break
+                else:
+                    buffer_tbs_idx-= 1
+                    attempt += 1
+
+            if (found == False):
+                print('RAT2 Allocation Failed mcs,nprb_ue = ',ue.mcs_val, random_nprb)
+                return 'RAT2_ALLOC_ATTEMPTS_EXHAUSTED'
+
+        tbs_allocated = self.tbldb.TBS_TABLE[mcs_ue,nprb_ue]
+        start_rb_ptr = self.check_contiguous_nprb_available(nprb_ue)
+        if (start_rb_ptr== -1):
+            return 'RAT2_ALLOC_FAILED_NO_CONTIG_PRB'
+        self.set_contiguous_rb_rat2(start_rb_ptr,nprb_ue);
+        self.remaining_rb -= nprb_ue
+        svc.update_queue_data_pfs(tbs_allocated)
+        dci_data = DCI_FMT_1a_INFO(start_rb_ptr,nprb_ue,mcs_ue,0,0,0,0,0)
+        ue.update_per_tti_scheduled_info(dci_data)
+
+    #   print('currenttti:',current_tti,'UE : ',ue.ue_id,'RAT2 Allocation mcs',mcs_ue,'nprb_ue',nprb_ue,'start_rb',start_rb_ptr,'tbs',tbs_allocated,'random_tbs',random_tbs,'buffer_tbs',buffer_tbs,'bo:',svc.bo,'ravg:',svc.ravg,'pfm:', svc.pfm)
+        csv_output.writerow((current_tti,ue.ue_id,ue.cqi_val,mcs_ue,nprb_ue,start_rb_ptr,tbs_allocated,random_tbs,buffer_tbs,svc.bo,svc.ravg,svc.rcurrent,svc.pfm))
+
+        return 'RAT2_ALLOCATION_SUCCESS'
+
+##      This is PFS based algorithm. Based on wideband cqi
+##    We are allocating using RAT-2
+    def schedule_ue_pfs(self,all_ues_list,all_svcs_list):
+
+        global current_tti;
+
+        for current_svc in all_svcs_list:
+            current_ue  = all_ues_list[current_svc.parent.ue_idx]
+            if (current_svc.bo != 0) and (self.remaining_rb != 0):
+                retval = self.allocate_rat2(current_ue,current_svc)
+            # elif (current_svc.bo  == 0):
+            #     print('tti : ',current_tti,'UE:',current_ue.ue_id,'not scheduled due to bo=0')
+
+
+
+    def schedule_ue_fss(self,fss_svc_list):
+##        A pythonic way of doing it would have been the 'filter()' method. But looks like it is not efficient.
+##        So I'm doing it in the regular way. we cannot break; from filter(). So it becomes inefficient.
+##        One doubt is that since subband based PF metric is calculated at the subband level,
+##        the RBG metric for all the subband will be the same. So allocation will become subband level: Otherwise there must be a
+##        different formula for PFM at the RBG level.
+
+#         'currenttti','ue_id','cqi','mcs','nprb_ue','tbs',bitmap, scqi[],
+        global current_tti
+        
+        self.fss_tti_data = []
+        
+        for fss_entry in fss_svc_list:
+            self.allocate_rat0(fss_entry,self.fss_tti_data);   
+            if (self.remaining_rb == 0):
+                break;
+            
+#             This function needs some very good optimization
+        for tti_data in self.fss_tti_data:
+            
+            ue = tti_data[0]
+            svc = tti_data[1]
+
+            format_string = str("\'#0"+str(self.num_rbgs)+"b\'")
+            print(format_string);
+            csv_output.writerow((current_tti,ue.ue_id,ue.cqi_val,ue.mcs_val,ue.dci1_info[0].nprb,self.tbldb.TBS_TABLE[ue.mcs_val,ue.dci1_info[0].nprb],tti_data[2],format(ue.dci1_info[0].rbg_bitmap,'#015b'),ue.scqi ))
+
+class SVC:
+    def __init__(self,svc_id,parent,pfm,ravg,nprb):
+        global n_dl_rb;
+        self.svc_id                  = svc_id;
+        self.pfm                     = pfm;
+        self.ravg                    = 872 # Assume default cqi = 5 and nprb = 10 when no data is received.
+        self.parent                  = parent;
+        self.rcurrent                = 872 # Assume default cqi = 5 and nprb = 10 when no data is received.
+        self.rcurrent_subband        = []
+        self.scheduled               = 0
+        self.bo                      = 0;
+        self.rat2_num_rbs            = nprb;
+        self.rat0_num_rbs_for_rbg_num   = 0;
+        self.qos_metric_weight       = float(1.0);
+        self.pfm_subband             = []
+
+        for i in range(0,self.parent.num_subbands):
+                self.rcurrent_subband.append(872)
+
+    def update_ravg(self,tbs):
+        self.ravg = PRB_RESOURCE_ALLOCATOR.alpha_ravg_iir*tbs + (1-PRB_RESOURCE_ALLOCATOR.alpha_ravg_iir)*self.ravg;
+
+    def update_rcurrent(self,cqi):
+        max_prb = n_dl_rb
+        self.rcurrent = PRB_RESOURCE_ALLOCATOR.tbldb.TBS_TABLE[max_prb,PRB_RESOURCE_ALLOCATOR.tbldb.cqi_to_itbs_mapping[self.parent.cqi_val]];
+
+    def update_rcurrent_sb(self,cqi):
+        max_prb = n_dl_rb
+#         print('update_rcurrent_sb: cqi = ',cqi)
+        return PRB_RESOURCE_ALLOCATOR.tbldb.TBS_TABLE[max_prb,PRB_RESOURCE_ALLOCATOR.tbldb.cqi_to_itbs_mapping[cqi]];
+
+    def update_rcurrent_subband(self,wcqi):
+        self.update_rcurrent(wcqi)
+
+        # For aperiodic cqi, we need to update the Rcurrent for all the subbands
+        # Then we should calculate the subband metric (which is nothing but the rbg metric)
+        # Calculating the subband metric is done using the map() function. We take the list of
+        # subbands and we assign the output list of Rcurrent. THis is done just to exploit
+        # functional programming.
+
+##      print('rcurrent before map:',self.rcurrent_subband)
+        self.rcurrent_subband = map(self.update_rcurrent_sb,self.parent.scqi)
+#       print('rcurrent after map:',self.rcurrent_subband)
+        self.pfm_subband = map(self.calculate_pfm_subband,self.rcurrent_subband )
+
+
+    def calculate_pfm_subband(self,rcurrent_sb):
+##        print('rcurrent:',self.rcurrent,'ravg:',self.ravg)
+        return ((rcurrent_sb**PRB_RESOURCE_ALLOCATOR.beta_rcurrent_exp) / (self.ravg**PRB_RESOURCE_ALLOCATOR.alpha_ravg_exp)) * self.qos_metric_weight ;
+
+    def calculate_pfm_subband_ravg_changed(self):
+            self.pfm_subband =  map(self.calculate_pfm_subband,self.rcurrent_subband )
+            
+
+    def calculate_pfm(self):
+##        print('rcurrent:',self.rcurrent,'ravg:',self.ravg)
+        self.pfm = ((self.rcurrent**PRB_RESOURCE_ALLOCATOR.beta_rcurrent_exp) / (self.ravg**PRB_RESOURCE_ALLOCATOR.alpha_ravg_exp)) * self.qos_metric_weight ;
+
+    def update_bo(self,buffer_occupancy):
+        self.bo = int(buffer_occupancy)
+
+    def add_bo(self,buffer_occupancy):
+        self.bo = self.bo + int(buffer_occupancy)
+
+    def remove_bo(self,tbs):
+        if(self.bo < tbs):
+            self.bo = 0
+        else:
+            self.bo -= tbs
+
+    def update_queue_data_pfs(self,tbs_allocated):
+        self.remove_bo(tbs_allocated)
+        self.tbs = tbs_allocated
+        self.scheduled = 1
+
+    def update_queue_data_fss(self,rbg_num):
+
+##        subtract from BO - that many bits and add to TBS that many bits.
+        global sched
+        
+#         self.tbs       += tbs_portion
+        ue                 = self.parent
+        self.rat0_num_rbs_for_rbg_num  = sched.rat0_find_num_rbs(rbg_num)
+        tbs_portion        = sched.tbldb.TBS_TABLE[ue.mcs_val, self.rat0_num_rbs_for_rbg_num]
+        self.remove_bo(tbs_portion)            
+        self.tbs           = sched.tbldb.TBS_TABLE[self.parent.mcs_val,self.parent.dci1_info[0].nprb]
+##        print('current_tti:',current_tti,'UE:',self.parent.ue_id,'rbg_num:',rbg_num,self.rat0_num_rbs_for_rbg_num,' are allocated',tbs_portion,'bits are removed. Totally there are :',self.parent.dci1_info[0].nprb, 'PRBs TBS updated to:',self.tbs)
+        self.scheduled     = 1
+    
+
+
+class DCI_FMT_1a_INFO:
+    def __init__(self,start_rb,num_rb,mcs,harq_proc_num,ndi,rv,tpc,dai):
+        self.start_rb    = start_rb
+        self.num_rb      = num_rb
+        self.mcs         = mcs
+        self.harq_proc   = harq_proc_num
+        self.ndi         = ndi
+        self.rv          = rv
+        self.tpc         = tpc
+        self.dai         = dai
+
+    def update_dci_fmt_1a(self,start_rb,num_rb,mcs,harq_proc_num,ndi,rv,tpc,dai):
+        self.start_rb    = start_rb
+        self.num_rb      = num_rb
+        self.mcs         = mcs
+        self.harq_proc   = harq_proc_num
+        self.scheduled   = 0
+        self.ndi         = ndi
+        self.rv          = rv
+        self.tpc         = tpc
+        self.dai         = dai
+
+
+class DCI_FMT_1_INFO:
+    def __init__(self):
+        self.rbg_bitmap = 0 ##- Resource block assignment:
+        self.nb_bits    = 0 ## - pvt variable which tells how many bits are set (or how many rbgs are allocated)
+        self.nprb       = 0 ## - pvt variable - This is needed to get nprb value.
+        self.mcs        = 0 ##- Modulation and coding scheme – 5 bits as defined in section 7.1.7 of [3]
+        self.harq_num   = 0 ##- HARQ process number – 3 bits (FDD), 4 bits (TDD)
+        self.ndi        = 0 ##- New data indicator – 1 bit
+        self.rv         = 0 ##- Redundancy version – 2 bits
+        self.tpc        = 0 ##- TPC command for PUCCH – 2 bits as defined in section 5.1.2.1 of [3]
+        self.dai        = 0 ##- Downlink Assignment Index
+
+    def update_dc_fmt_1_bitmap(self,rbg_num):
+        global sched
+        self.rbg_bitmap |= 1 << rbg_num
+        self.nb_bits+=1
+
+##        update the number of prb
+        last_rbg = sched.num_rbgs-1
+        if ( last_rbg == rbg_num ):
+            self.nprb += sched.last_rbg_size
+        else:
+            self.nprb += (sched.rbg_size)
+
+class UE:
+
+    def __init__(self,ue_id,ue_idx,cqi_tti_val,cqi_periodicity_val,cqi_index,cqi_val,mcs_val,pfm,ravg,nprb,cqi_type_val,cqi_delta_val,buffer_bits_val,buffer_type_val,buffer_period_val):
+        global sched
+        global sched_lists
+        global n_dl_rb
+
+        self.ue_id           = ue_id
+        self.ue_idx          = ue_idx
+
+
+##        Initialize the cqi inputs
+        self.cqi_type        = cqi_type_val
+        self.cqi_val         = cqi_val
+        self.cqi_periodicity = cqi_periodicity_val
+        self.cqi_delta       = cqi_delta_val
+        self.mcs_val         = sched.tbldb.cqi_to_itbs_mapping[self.cqi_val]
+        self.cqi_tti         = cqi_tti_val
+        self.scqi            = []
+
+        self.num_subbands    = sched.num_subbands
+        for i in range(0,self.num_subbands):
+            self.scqi.append(int(cqi_val))
+##        print('ue:',self.ue_id,'len:',len(self.scqi),'subband cqis:',self.scqi)
+
+##        Initialize the buffer inputs
+        self.buffer_bits     = buffer_bits_val
+        self.buffer_type     = buffer_type_val
+        self.buffer_period   = int(buffer_period_val);
+        self.buffer_tti      = int(1) # Valid for buffer_type = 'regular' only.
+
+##        Initialize other important inputs
+        self.num_rbs         = (nprb);
+        self.category        = 3
+        self.dci             = []
+        self.dci1_info       = []
+        self.mode            = 'PFS' # PFS means RAT2 allocations based on periodic wcqi. FSS means RAT0 allocation based on aperiodic scqi.
+
+
+# How will I access the UE object from a service object ?
+# Similar to access the parent object from a child object ?
+# See http://stackoverflow.com/questions/10791588/getting-container-parent-object-from-within-pythonty
+        self.num_of_svc      = 1 #Only de5f bearer.
+        self.svc_list        = []
+        for count in range(1):
+            new_svc_entry = SVC(count,self,pfm,ravg,nprb)
+            self.svc_list.append(new_svc_entry)
+            sched_lists.all_svcs_list.append(new_svc_entry)
+
+#----- __init__ ends here.
+
+    def update_per_tti_scheduled_info(self,dci):
+        if self.dci:
+           # print('DCI list not empty ? Should not come here')
+            self.dci.pop()
+        self.dci.append(dci)
+
+    def reset_per_ue_tti_info(self):
+#         Remove all the items in the dci list
+        del self.dci[:]
+
+
+    def update_periodic_wcqi(self):
+        curr_cqi =  self.cqi_val
+        if self.cqi_tti == current_tti:
+            if self.cqi_type == 'increasing':
+                self.cqi_tti = self.cqi_tti + self.cqi_periodicity
+                curr_cqi = min(curr_cqi+self.cqi_delta, 15)
+##              print('[TTI:',current_tti,'] UE',self.ue_id,'CQI updated(inc) to :', curr_cqi,'Next tti will be ',self.cqi_tti + self.cqi_periodicity)
+            elif self.cqi_type == 'decreasing':
+                self.cqi_tti = self.cqi_tti + self.cqi_periodicity
+                curr_cqi = max(curr_cqi-self.cqi_delta,1)
+##              print('[TTI:',current_tti,'] UE',self.ue_id,'CQI updated(dec) to :', curr_cqi,'Next tti will be ',self.cqi_tti + self.cqi_periodicity)
+            elif self.cqi_type == 'random':
+                curr_cqi = random.randint(5,15)
+                self.cqi_tti = self.cqi_tti + self.cqi_periodicity
+##                print('[TTI:',current_tti,'] UE',self.ue_id,'CQI updated(rand) to :',curr_cqi,'Next tti will be ',self.cqi_tti + self.cqi_periodicity)
+        self.cqi_val = curr_cqi
+        self.mcs_val = sched.tbldb.cqi_to_itbs_mapping[self.cqi_val]
+
+        for svc in self.svc_list:
+            svc.update_rcurrent(self.cqi_val)
+            svc.calculate_pfm();
+
+
+    def update_aperiodic_cqi(self):
+
+        global n_dl_rb;
+
+        global sched;
+
+        subband_delta = [0,1,2,-1]; # 36.213 Table 7.2.1-2:  Mapping subband differential CQI value to offset level
+
+        acqi_cfg = random.randint(1,5)
+
+        wcqi = random.randint(max(self.cqi_val-3,0),min(self.cqi_val+3,15))
+
+        number_of_subbands = int(math.ceil(float(n_dl_rb)/sched.tbldb.subband_sysbw[n_dl_rb]))
+
+        self.cqi_val = wcqi
+        
+#         TODO: Discuss the possible options for mcs conversions
+        self.mcs_val = sched.tbldb.cqi_to_itbs_mapping[self.cqi_val]
+
+##        print('UE:',self.ue_id,'subband cqi',self.scqi)
+
+        if   (acqi_cfg == 1):
+##            All the subbands have the same offset value as the wideband cqi
+            for i in range(0,number_of_subbands):
+                self.scqi[i] = wcqi;
+                mode = 'PFS'
+
+        elif (acqi_cfg == 2):
+##            There are 2 sets of subands. 1 set has offset 00 and the other set is randomly chosen from {01,10,11}
+            subband_set  = random.randint(1,2)
+            offset       = set(range(1,4));
+            x            = random.randint(1,3) # This will give the required randomness
+            wcqi_count = 0
+            for i in range(0,number_of_subbands):
+                if (subband_set == 1):
+##                    Set 1
+                    self.scqi[i]    = wcqi;
+                    wcqi_count += 1
+                else:
+##                    Set 2
+                    self.scqi[i] = min(int(subband_delta[x]) + wcqi,15);
+            if (wcqi_count > number_of_subbands/2):
+                mode = 'PFS'
+            else:
+                mode = 'FSS'
+
+
+        elif (acqi_cfg == 3):
+##            There are 3 sets of subands. 1 set has offset 00 and the other 2 sets  have 2 values randomly chosen from {01,10,11}
+            offset       = set(range(1,4));
+            x            = random.randint(1,3)
+            offset.remove(x)
+            y            = offset.pop()
+            wcqi_count = 0
+
+            for i in range(0,number_of_subbands):
+                subband_set  = random.randint(1,3)
+                if (subband_set == 1):
+##                    Set 1
+                    self.scqi[i]    = wcqi;
+                    wcqi_count += 1
+                elif (subband_set == 2):
+##                    Set 2
+                    self.scqi[i] = min(int(subband_delta[x]) + wcqi,15);
+                elif (subband_set == 3):
+##                    Set 3
+                    self.scqi[i] = min(int(subband_delta[y]) + wcqi,15);
+
+            if (wcqi_count > number_of_subbands/2):
+                mode = 'PFS'
+            else:
+                mode = 'FSS'
+
+        elif (acqi_cfg == 4):
+##            There are 4 sets of subands. They can be any of {00,01,10,11
+            offset       = set(range(1,4));
+            x            = random.randint(1,3)
+            offset.remove(x)
+            y            = offset.pop()
+            z            = offset.pop()
+
+            mode = 'FSS'
+            for i in range(0,number_of_subbands):
+                subband_set  = random.randint(1,3)
+                if (subband_set == 1):
+##                    Set 1
+                    self.scqi[i]    = wcqi;
+                elif (subband_set == 2):
+##                    Set 2
+                    self.scqi[i] = min(int(subband_delta[x]) + wcqi,15);
+                elif (subband_set == 3):
+##                    Set 3
+                    self.scqi[i] = min(int(subband_delta[y]) + wcqi,15);
+                elif (subband_set == 4):
+##                      Set 4
+                    self.scqi[i] = min(int(subband_delta[z]) + wcqi,15);
+
+        for svc in self.svc_list:
+            svc.update_rcurrent(self.cqi_val)
+            svc.calculate_pfm();
+            svc.update_rcurrent_subband(self.cqi_val)
+
+
+    def update_bo_for_svcs(self):
+#        import pdb; pdb.set_trace();
+        for svc in self.svc_list:
+            if self.buffer_type == 'regular':
+                if self.buffer_tti == current_tti:
+                    svc.add_bo(self.buffer_bits)
+            else:
+                likelyhood = random.randint(1,100)
+                if likelyhood < 50:
+                    svc.update_bo(random.randint(1,80)*500)
+
+        if self.buffer_type == 'regular' and self.buffer_tti == current_tti:
+            self.buffer_tti += self.buffer_period
+
+
+class UE_AND_SVC_LISTS:
+
+    global sched
+    global scheduling_mode
+
+    all_svcs_list    = []
+    all_ues_list     = []
+    fss_matrix       = []
+
+    def __init__(self):
+        print('all_svcs_list and all_ues_list created')
+
+
+    def schedule(self):
+        if (scheduling_mode == 'PFS'):
+            sched.schedule_ue_pfs(self.all_ues_list,self.all_svcs_list)
+        else:
+            self.construct_fss_matrix()
+            sched.schedule_ue_fss(self.fss_matrix)
+            
+
+
+    def construct_fss_matrix(self):
+
+        global sched 
+        
+        del self.fss_matrix[:]
+        
+        for svc in self.all_svcs_list:
+            sb_num = 0
+            buffer_tbs = sched.tbldb.round_it_to_next_tbs(sched.tbldb.TBS_LIST,svc.bo)
+            for i in svc.pfm_subband:
+                fss_matrix_entry = (svc, i,sb_num,buffer_tbs) #----> assgt-1
+                self.fss_matrix.append(fss_matrix_entry)
+                sb_num += 1
+                
+##        Note that fss_matrix_entry is a tuple. the lambda function returns the second part of the tuple
+##        which is i from assgt-1 above , which is the subband pfm metric. Hence we are sorting the
+##        matrix based on the subband pfm metric
+        self.fss_matrix.sort(key=lambda x: x[1],reverse = True)
+        print('FSS Matrix sorting completed')
+
+##        if (current_tti%9 ==0):
+##            for entry in self.fss_matrix:
+##                print('UE:',entry[0].parent.ue_id, entry)
+##        
+
+    def update_ue_cqi_ttis(self):
+        for ue_entry in self.all_ues_list:
+##            import pdb; pdb.set_trace()
+            if ue_entry.cqi_type == 'aperiodic':
+                ue_entry.update_aperiodic_cqi()
+            else:
+                ue_entry.update_periodic_wcqi()
+
+    def update_ue_buffers(self):
+    ##    Right now, we can update the buffers every buffer_periodicity milliseconds on a per UE basis.
+    ##    In the UE object, we have a method where we can use the buffer data (however we want) among services, using a weighted method if
+    ##    we want to support multiple bearers in the future.
+        for ue_entry in self.all_ues_list:
+            ue_entry.update_bo_for_svcs()
+
+    def post_schedule_update_information(self):
+        global scheduling_mode
+        
+        if (scheduling_mode=='PFS'):
+            
+            for svc in self.all_svcs_list:
+                if svc.scheduled == 1:
+                    svc.update_ravg(svc.tbs)
+                    svc.calculate_pfm();
+                    del svc.parent.dci1_info[:]
+                else:
+                    svc.update_ravg(0)
+                    svc.calculate_pfm()
+                    
+                svc.scheduled = 0
+            # Re-sort
+            self.all_svcs_list.sort(key=lambda svc: svc.pfm,reverse = True)
+            
+        else:
+            for svc in self.all_svcs_list:
+                if svc.scheduled == 1:
+                    svc.update_ravg(svc.tbs)
+                    svc.calculate_pfm();
+                    svc.calculate_pfm_subband_ravg_changed();
+                    del svc.parent.dci1_info[:]
+                else:
+                    svc.update_ravg(0)
+                    svc.calculate_pfm()
+                    svc.calculate_pfm_subband_ravg_changed();
+                svc.scheduled = 0
+            
+
+
+
+##  XML Parsing routine.
+##  1. Open the configuration file.
+##  2. Populate the global structures.
+
+def config_file_parser():
+
+    global cqi_input_lst,cqi_periodicity_lst,cqi_type_lst,cqi_delta_lst,buffer_bits_lst,buffer_type_lst,buffer_periodicity_lst,ue_id_lst,nprb_lst,num_ues,num_jokers;
+
+    # These globals are place holders for the xml file variables.
+    cqi_input_lst    = []; cqi_periodicity_lst =[]; cqi_type_lst          =[]; cqi_delta_lst = [];
+    buffer_bits_lst   =[]; buffer_type_lst     =[]; buffer_periodicity_lst=[];
+    ue_id_lst        = []; nprb_lst            =[];
+
+    tree = ET.parse('data3.xml');
+    root = tree.getroot()
+
+    ue_id_lstx     = 0
+    i = 0
+
+    # File parsing part   
+    for ue in root:
+##        import pdb; pdb.set_trace();
+
+        if(ue.find('id').text != 'joker'):
+            ue_id_lst.append(ue.find('id').text)
+            i = 0
+            for cqi_info in ue.findall('cqi'):
+                cqi_input_lst.append(int(cqi_info.find('cqi_val').text))
+                cqi_periodicity_lst.append(int(cqi_info.find('cqi_periodicity').text))
+                cqi_type_lst.append(cqi_info.find('cqi_type').text)
+                cqi_delta_lst.append(int(cqi_info.find('cqi_delta').text))
+                print('cqi_input:',cqi_input_lst[i],'periodicity:',cqi_periodicity_lst[i],'delta:',cqi_delta_lst[i],'type:', cqi_type_lst[i])
+                i = i+1
+            i=0
+            for buffer_info in ue.findall('buffer'):
+                buffer_bits_lst.append(int(buffer_info.find('buffer_bits').text))
+                buffer_type_lst.append(buffer_info.find('buffer_type').text)
+                buffer_periodicity_lst.append(buffer_info.find('buffer_periodicity').text);
+                print('buffer_bits:',buffer_bits_lst[i],'buffer_type:',buffer_type_lst[i],'buffer_periodicity:',buffer_periodicity_lst[i])
+                i = i+1
+
+            nprb_lst_tuple = [ue.find('nprb_low').text,ue.find('nprb_high').text]
+            nprb_lst.append(nprb_lst_tuple);
+            print('nprb_lst: ', nprb_lst[ue_id_lstx])
+            num_ues += 1
+            ue_id_lstx = ue_id_lstx+1
+        else:
+            num_jokers = int(ue.find('number_of_jokers').text)
+            print(num_jokers,'joker(s) found. Are you ready Batman ?')
+
+            for i in (range(0,num_jokers)):
+                ue_id_lst.append(1000+i)
+                i       += 1
+                num_ues += 1
+                ue_id_lstx = ue_id_lstx+1
+
+if __name__ == '__main__':
+
+    global current_tti
+    global n_dl_rb
+    global num_ues
+    global num_jokers
+    global sched
+
+    global outfile
+    global csv_output
+
+    global cqi_input_lst,cqi_periodicity_lst,cqi_type_lst,cqi_delta_lst,buffer_bits_lst,buffer_type_lst,buffer_periodicity_lst,ue_id_lst,nprb_lst;
+
+    global scheduling_mode;
+    
+
+    num_ttis           = 1000
+    num_ues            = 0
+    num_jokers         = 0
+
+    init_pfm           = 0.5 # Need to get a very good idea on this. Some r&d is needed.
+    init_ravg          = 872
+
+##    Parse the input file
+    config_file_parser()
+    print('Parsing config file done...Found', num_ues,'UEs')
+
+##    Create the scheduler objects and tables
+    sched = PRB_RESOURCE_ALLOCATOR(n_dl_rb)
+    sched.init_resource_maps()
+    print('Scheduler objects created...')
+
+##    Create the sorted UE and SVC lists objects and then populate it based on the input file
+    sched_lists        = UE_AND_SVC_LISTS()
+    for i in range(0,num_ues):
+        if( int(ue_id_lst[i]) < 1000 ): # We are dealing with regular UEs not jokers.
+            sched_lists.all_ues_list.append(UE(ue_id_lst[i],i,0,cqi_periodicity_lst[i],0, cqi_input_lst[i],5,init_pfm, init_ravg,nprb_lst[i], cqi_type_lst[i], cqi_delta_lst[i],buffer_bits_lst[i],buffer_type_lst[i],buffer_periodicity_lst[i]))
+        else:
+            # Jokers.Right now UEs with the name tag 'joker' support only aperiodic cqis
+            #(self,ue_id,ue_idx,cqi_tti_val,cqi_periodicity_val,cqi_index,cqi_val,mcs_val,pfm,ravg,nprb,cqi_type_val,cqi_delta_val,buffer_bits_val,buffer_type_val,buffer_period_val)
+            sched_lists.all_ues_list.append(UE(ue_id_lst[i],i,random.randint(0,9),random.randint(1,5)*10,0,10,5,init_pfm, init_ravg,[30,40],'aperiodic',0,0,0,0))
+
+##    Create the output file
+    outfile = open('sched.csv','w')
+    csv_output = csv.writer(outfile, dialect='excel',lineterminator='\n')
+    
+    
+    
+
+    scheduling_mode = 'FSS'
+
+    if scheduling_mode == 'PFS':
+         csv_output.writerow(('currenttti','ue_id','cqi','mcs','nprb_ue','start_rb','tbs','random_tbs','buffer_tbs','bufferoccupancy','ravg','rcurrent','pfm'))
+    else:
+        csv_output.writerow(('currenttti','ue_id','cqi','mcs','nprb_ue','tbs','buffer_tbs','bitmap', 'scqi[]'))
+
+
+
+##    Start the ttis
+    current_tti = 1
+    for tti in range(1,num_ttis):
+
+        sched.refresh_resource_maps()
+
+        sched_lists.update_ue_cqi_ttis()
+
+        sched_lists.update_ue_buffers()
+
+        sched_lists.schedule()
+
+        sched_lists.post_schedule_update_information()
+
+        current_tti = current_tti+1
+
+    print('current_tti:', current_tti)
+    outfile.close()
